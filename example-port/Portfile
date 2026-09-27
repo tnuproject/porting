@@ -1,0 +1,8 @@
+PORTNAME=       hello-tiramisu
+PORTVERSION=    1.0.0
+CATEGORIES=     misc
+MAINTAINER=     developer@example.org
+COMMENT=        Example Hello World port for Tiramisu OS
+WWW=            https://github.com/tnuproject/porting
+LICENSE=        BSD2CLAUSE
+RUN_DEPENDS=    coreutils:sysutils/coreutils

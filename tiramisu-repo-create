@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+tiramisu-repo-create - Repository Catalog Builder for Tiramisu OS.
+Copyright (c) 2026 Tiramisu Project.
+
+Scans a directory of .pkg files, reads +MANIFEST metadata, calculates SHA-256
+hashes, verifies dependencies, and generates repo.json for hosting.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tarfile
+import time
+
+def compute_sha256(filepath):
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+def extract_manifest(pkg_path):
+    try:
+        with tarfile.open(pkg_path, 'r:*') as tar:
+            for member in tar.getmembers():
+                if member.name == '+MANIFEST' or member.name.endswith('/+MANIFEST'):
+                    f = tar.extractfile(member)
+                    if f:
+                        data = f.read().decode('utf-8', errors='ignore')
+                        return json.loads(data)
+    except Exception as e:
+        print(f"  [WARN] Failed to parse +MANIFEST in {os.path.basename(pkg_path)}: {e}")
+    return None
+
+def build_repository(args):
+    pkg_dir = os.path.abspath(args.packages_dir)
+    if not os.path.isdir(pkg_dir):
+        print(f"Error: Packages directory '{pkg_dir}' does not exist.", file=sys.stderr)
+        return 1
+
+    out_json = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+
+    base_url = args.url.rstrip('/')
+
+    packages = []
+    available_pkg_names = set()
+
+    pkg_files = sorted([f for f in os.listdir(pkg_dir) if f.endswith('.pkg')])
+    if not pkg_files:
+        print(f"Warning: No .pkg files found in '{pkg_dir}'.", file=sys.stderr)
+
+    print(f"==> Indexing {len(pkg_files)} packages from {pkg_dir}...")
+
+    for fname in pkg_files:
+        full_path = os.path.join(pkg_dir, fname)
+        size = os.path.getsize(full_path)
+        sha256 = compute_sha256(full_path)
+
+        manifest = extract_manifest(full_path)
+        if manifest:
+            name = manifest.get('name')
+            version = manifest.get('version', '1.0.0')
+            desc = manifest.get('comment') or manifest.get('desc') or f"{name} package"
+            category = manifest.get('origin', 'user/misc').split('/')[0] if '/' in manifest.get('origin', '') else 'misc'
+            deps = manifest.get('deps', [])
+            if isinstance(deps, dict):
+                deps = list(deps.keys())
+        else:
+            # Fallback to filename parsing
+            base = fname[:-4]
+            parts = base.rsplit('-', 1)
+            name = parts[0]
+            version = parts[1] if len(parts) > 1 else '1.0.0'
+            desc = f"{name} package"
+            category = "misc"
+            deps = []
+
+        available_pkg_names.add(name)
+        pkg_url = f"{base_url}/packages/{fname}"
+
+        entry = {
+            "name": name,
+            "version": version,
+            "category": category,
+            "description": desc,
+            "size": size,
+            "sha256": sha256,
+            "depends": deps,
+            "url": pkg_url
+        }
+        packages.append(entry)
+        print(f"  + {name} {version} ({size} bytes, sha256: {sha256[:12]}...)")
+
+    # Dependency check
+    missing_deps = {}
+    for p in packages:
+        for dep in p['depends']:
+            if dep not in available_pkg_names:
+                missing_deps.setdefault(dep, []).append(p['name'])
+
+    if missing_deps:
+        print("\nDependency Warnings (external dependencies required):")
+        for dep, needed_by in missing_deps.items():
+            print(f"  ! '{dep}' required by: {', '.join(needed_by)}")
+
+    # Catalog structure
+    catalog = {
+        "repository": {
+            "name": args.name,
+            "description": args.description or f"Tiramisu Package Repository ({args.name})",
+            "url": base_url,
+            "maintainer": args.maintainer or "ports@tiramisu.org",
+            "version": "1.0.0",
+            "updated": time.strftime('%Y-%m-%d')
+        },
+        "packages": packages
+    }
+
+    with open(out_json, 'w', encoding='utf-8') as f:
+        json.dump(catalog, f, indent=2)
+        f.write("\n")
+
+    print(f"\n[OK] Repository catalog created successfully: {out_json}")
+    print(f"     Total Packages: {len(packages)}")
+    print(f"     Base URL:       {base_url}")
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Tiramisu Third-Party Repository Catalog Builder"
+    )
+    parser.add_argument("--name", default="universe", help="Repository name (e.g. universe, myrepo)")
+    parser.add_argument("--url", required=True, help="Base URL where repo is hosted (e.g. https://raw.githubusercontent.com/tnuproject/universe/main)")
+    parser.add_argument("--packages-dir", required=True, help="Path to directory containing .pkg files")
+    parser.add_argument("--out", default="repo.json", help="Output path for repo.json")
+    parser.add_argument("--description", help="Repository description")
+    parser.add_argument("--maintainer", help="Repository maintainer contact")
+
+    args = parser.parse_args()
+    return build_repository(args)
+
+if __name__ == "__main__":
+    sys.exit(main())

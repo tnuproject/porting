@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""
+tiramisu-pkg-create - Third-party developer package packaging tool for Tiramisu OS.
+Copyright (c) 2026 Tiramisu Project.
+
+Packages staged software directories into standard Tiramisu .pkg archives with
++MANIFEST metadata and SHA-256 verification.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tarfile
+import time
+
+def compute_sha256(filepath):
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+def check_elf_binary(filepath):
+    try:
+        with open(filepath, 'rb') as f:
+            magic = f.read(4)
+            if magic == b'\x7fELF':
+                ident = f.read(12)
+                # ident[3] is EI_OSABI: 0=System V, 9=FreeBSD
+                is_freebsd = (ident[3] == 9)
+                return True, is_freebsd
+    except Exception:
+        pass
+    return False, False
+
+def create_package(args):
+    stage_dir = os.path.abspath(args.stage_dir)
+    if not os.path.isdir(stage_dir):
+        print(f"Error: Stage directory '{stage_dir}' not found.", file=sys.stderr)
+        return 1
+
+    out_pkg = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(out_pkg), exist_ok=True)
+
+    # Collect dependencies
+    deps = [d.strip() for d in args.deps.split(',') if d.strip()] if args.deps else []
+
+    # Check staged files
+    staged_files = []
+    has_elf = False
+    for root, _, files in os.walk(stage_dir):
+        for f in sorted(files):
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, stage_dir).replace('\\', '/')
+            staged_files.append((full_path, rel_path))
+            is_elf, is_fbsd = check_elf_binary(full_path)
+            if is_elf:
+                has_elf = True
+                fbsd_info = " (FreeBSD ABI)" if is_fbsd else ""
+                print(f"  [ELF] {rel_path}{fbsd_info}")
+
+    if not staged_files:
+        print(f"Error: No files found in staging directory '{stage_dir}'.", file=sys.stderr)
+        return 1
+
+    # Generate +MANIFEST
+    manifest = {
+        "name": args.name,
+        "version": args.version,
+        "origin": args.origin or f"user/{args.name}",
+        "comment": args.comment or f"{args.name} package for Tiramisu OS",
+        "desc": args.desc or f"{args.name} version {args.version} packaged for Tiramisu OS.",
+        "maintainer": args.maintainer or "ports@tiramisu.org",
+        "www": args.www or f"https://github.com/tnuproject/universe",
+        "prefix": args.prefix or "/usr/local",
+        "deps": deps,
+        "files": [rel for _, rel in staged_files],
+        "created": int(time.time()),
+        "abi": "FreeBSD:14:amd64"
+    }
+
+    manifest_bytes = json.dumps(manifest, indent=2).encode('utf-8')
+
+    # Create tar archive
+    print(f"==> Packaging '{args.name}-{args.version}' -> {out_pkg}...")
+    with tarfile.open(out_pkg, 'w', format=tarfile.USTAR_FORMAT) as tar:
+        # Add +MANIFEST first
+        ti = tarfile.TarInfo(name="+MANIFEST")
+        ti.size = len(manifest_bytes)
+        ti.mtime = int(time.time())
+        ti.mode = 0o644
+        ti.type = tarfile.REGTYPE
+        import io
+        tar.addfile(ti, fileobj=io.BytesIO(manifest_bytes))
+
+        # Add staged files
+        for full_path, rel_path in staged_files:
+            stat = os.stat(full_path)
+            with open(full_path, 'rb') as f:
+                content = f.read()
+            ti = tarfile.TarInfo(name=rel_path)
+            ti.size = len(content)
+            ti.mtime = int(stat.st_mtime)
+            ti.mode = stat.st_mode
+            ti.type = tarfile.REGTYPE
+            tar.addfile(ti, fileobj=io.BytesIO(content))
+
+    pkg_size = os.path.getsize(out_pkg)
+    pkg_sha = compute_sha256(out_pkg)
+
+    print(f"[OK] Successfully built {os.path.basename(out_pkg)}")
+    print(f"     Size:   {pkg_size} bytes")
+    print(f"     SHA256: {pkg_sha}")
+    print(f"     Files:  {len(staged_files)} file(s) bundled")
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Tiramisu Third-Party Package Creation Utility"
+    )
+    parser.add_argument("--name", required=True, help="Package name (e.g. nano, htop)")
+    parser.add_argument("--version", required=True, help="Package version (e.g. 1.2.3)")
+    parser.add_argument("--stage-dir", required=True, help="Path to staging root directory")
+    parser.add_argument("--out", required=True, help="Output .pkg file path")
+    parser.add_argument("--origin", help="Port category/name (e.g. editors/nano)")
+    parser.add_argument("--comment", help="One-line summary")
+    parser.add_argument("--desc", help="Detailed package description")
+    parser.add_argument("--deps", help="Comma-separated runtime dependencies")
+    parser.add_argument("--maintainer", help="Maintainer email")
+    parser.add_argument("--www", help="Project website")
+    parser.add_argument("--prefix", default="/usr/local", help="Installation prefix")
+
+    args = parser.parse_args()
+    return create_package(args)
+
+if __name__ == "__main__":
+    sys.exit(main())
